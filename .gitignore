@@ -1,0 +1,20 @@
+# binaries / tools
+tools/arduino-cli.exe
+*.exe
+*.bin
+
+# logs
+tools/logs/
+*.log
+*.err
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# os
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
