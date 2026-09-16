@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pixel ST7789 · 240×240 像素图转换</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <h1>Pixel ST7789</h1>
+          <p>本地图片 → 1.54" 240×240 SPI 彩屏像素图</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <label class="btn primary" for="file-input">选择图片</label>
+        <input id="file-input" type="file" accept="image/*" hidden />
+        <button id="btn-export-png" class="btn" disabled>导出 PNG</button>
+        <button id="btn-export-c" class="btn" disabled>导出 C 数组</button>
+        <button id="btn-export-bin" class="btn" disabled>导出 BIN</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel source-panel">
+        <div class="panel-head">
+          <h2>源图裁剪</h2>
+          <span class="hint">拖拽选框 · 滚轮缩放 · 空格拖动画布</span>
+        </div>
+        <div id="drop-zone" class="drop-zone">
+          <canvas id="source-canvas"></canvas>
+          <div id="empty-state" class="empty-state">
+            <div class="empty-icon">▣</div>
+            <p>拖入图片，或点击「选择图片」</p>
+            <p class="sub">支持 PNG / JPG / WEBP / GIF 首帧</p>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button id="btn-fit" class="btn ghost" disabled>适应窗口</button>
+          <button id="btn-reset-crop" class="btn ghost" disabled>重置裁剪</button>
+          <label class="check">
+            <input type="checkbox" id="lock-square" checked />
+            锁定输出比例
+          </label>
+          <span id="crop-info" class="meta">—</span>
+        </div>
+      </section>
+
+      <section class="panel controls-panel">
+        <div class="panel-head">
+          <h2>屏幕参数</h2>
+        </div>
+
+        <div class="field">
+          <label for="screen-preset">预设屏幕</label>
+          <select id="screen-preset">
+            <option value="240x240" selected>ST7789 1.54" · 240×240</option>
+            <option value="135x240">ST7789 1.14" · 135×240</option>
+            <option value="240x280">ST7789 1.69" · 240×280</option>
+            <option value="240x320">ST7789 2.0" · 240×320</option>
+            <option value="320x240">ILI9341 · 320×240</option>
+            <option value="custom">自定义…</option>
+          </select>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="out-w">宽 W</label>
+            <input id="out-w" type="number" min="1" max="512" value="240" />
+          </div>
+          <div class="field">
+            <label for="out-h">高 H</label>
+            <input id="out-h" type="number" min="1" max="512" value="240" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="scale-mode">缩放算法</label>
+          <select id="scale-mode">
+            <option value="smooth" selected>平滑（适合照片）</option>
+            <option value="nearest">最近邻（保留硬边）</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="dither-mode">抖动 Dither</label>
+          <select id="dither-mode">
+            <option value="none" selected>关闭</option>
+            <option value="floyd">Floyd–Steinberg</option>
+            <option value="bayer4">Bayer 4×4</option>
+            <option value="bayer8">Bayer 8×8</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="color-depth">色深（模拟 RGB565）</label>
+          <select id="color-depth">
+            <option value="16" selected>16-bit RGB565（真机）</option>
+            <option value="15">15-bit RGB555</option>
+            <option value="12">12-bit RGB444</option>
+            <option value="8">8-bit RGB332</option>
+            <option value="1">1-bit 黑白</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label class="check">
+            <input type="checkbox" id="show-grid" />
+            预览显示像素网格
+          </label>
+        </div>
+
+        <div class="field">
+          <label for="preview-zoom">预览放大</label>
+          <div class="range-row">
+            <input id="preview-zoom" type="range" min="1" max="4" value="2" />
+            <span id="zoom-label">2×</span>
+          </div>
+        </div>
+
+        <div class="stats" id="stats">
+          <div><span>输出尺寸</span><strong id="stat-size">240×240</strong></div>
+          <div><span>像素数</span><strong id="stat-pixels">57,600</strong></div>
+          <div><span>RGB565 字节</span><strong id="stat-bytes">115,200</strong></div>
+        </div>
+
+        <div class="panel-head" style="margin-top: 18px;">
+          <h2>单片机用法</h2>
+        </div>
+        <pre class="code-block" id="usage-snippet">// Arduino + TFT_eSPI / Adafruit_ST7789
+// 将导出的数组放到 sketch 同目录，再：
+// tft.pushImage(0, 0, 240, 240, image_data);
+
+// ESP-IDF / LVGL 可直接用 .bin：
+// esp_lcd_panel_draw_bitmap(panel, 0, 0, 240, 240, buf);</pre>
+
+        <div class="panel-head" style="margin-top: 12px;">
+          <h2>推到 Clawd Mochi</h2>
+        </div>
+        <pre class="code-block">// 导出 BIN 后，在仓库根目录执行：
+// python tools\push-frame.py tools\st7789-convert\st7789_240x240.bin
+// 或直接推原图（自动缩放）：
+// python tools\push-frame.py photo.png --quit-to-rest
+// 需先烧录含 frame 协议的 clawd_mochi 固件</pre>
+          <!-- snippet updated by app.js with live dimensions -->
+      </section>
+
+      <section class="panel preview-panel">
+        <div class="panel-head">
+          <h2>像素预览</h2>
+          <span id="preview-badge" class="badge">240×240 · RGB565</span>
+        </div>
+        <div class="preview-stage">
+          <div class="device-frame">
+            <div class="device-bezel">
+              <canvas id="preview-canvas" width="240" height="240"></canvas>
+              <div id="pixel-grid-overlay" class="pixel-grid-overlay" hidden></div>
+            </div>
+            <div class="device-label" id="device-label">ST7789 1.54" SPI · 240×240</div>
+          </div>
+          <canvas id="zoom-canvas" class="zoom-canvas" width="240" height="240"></canvas>
+        </div>
+        <p class="preview-note">左侧为接近真机 1:1 显示；右侧为放大像素视图（可用滑块调倍率）。</p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>纯前端处理，图片不会上传到任何服务器</span>
+      <span>目标：ST7789 240×240 · RGB565 · SPI</span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

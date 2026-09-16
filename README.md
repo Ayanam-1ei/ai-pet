@@ -95,7 +95,7 @@ tft.setRotation(1);
 ```
 ai-pet/
 ├── clawd_mochi/
-│   └── clawd_mochi.ino          # 固件本体（Arduino）
+│   └── clawd_mochi.ino          # 固件本体（Arduino，含表情机 + 刷图扩展）
 ├── clawd_mochi_diag/
 │   └── clawd_mochi_diag.ino     # 屏幕诊断：只刷纯色，查花屏/白屏
 └── tools/
@@ -103,10 +103,17 @@ ai-pet/
     ├── send-state.ps1           # 手动发一个状态词
     ├── mochi-bridge.py          # M5 桥接：跟 AI 活动自动变脸
     ├── start-bridge.ps1         # 启动桥接
-    ├── pixel-studio.html        # 像素画板（浏览器）
+    ├── pixel-studio.html        # 48×48 格子画板（浏览器）
     ├── pixel-studio.py          # 画板本地服务 + 串口推送
     ├── start-pixel-studio.ps1   # 启动画板
-    └── push-test-sprite.py      # 命令行推一张测试图
+    ├── push-test-sprite.py      # 命令行推 48×48 测试图
+    ├── push-frame.py            # M6：推全屏 240×240 静态图
+    ├── README-frame.md          # 刷图协议说明
+    └── st7789-convert/          # 图片 → ST7789 像素图网页工具
+        ├── index.html
+        ├── app.js
+        ├── styles.css
+        └── st7789_240x240.bin   # 示例 RGB565 小端帧
 ```
 
 ---
@@ -236,7 +243,7 @@ pip install --user pyserial
 - 串口识别靠 `VID_303A&PID_1001`，认对一次后会写入缓存
 - 与画板**不要同时开**（会抢 COM 口）
 
-### 4. 像素画板（自定义图案）
+### 4. 像素画板（48×48 格子手绘）
 
 ```powershell
 .\tools\start-pixel-studio.ps1
@@ -245,6 +252,62 @@ pip install --user pyserial
 浏览器打开 `http://127.0.0.1:8765/`，48×48 格子画完点「推送到麻薯」。
 
 > 自定义像素图存在内存里，断电/复位会丢失；收到状态词会切回表情引擎。
+
+### 5. 任意图片 → 全屏静态图（M6 frame）
+
+配套网页工具已收进仓库：`tools/st7789-convert/`（来自独立项目 `S:\可视化\st7789`）。
+
+**步骤：**
+
+1. 用浏览器打开 `tools/st7789-convert/index.html`
+2. 拖入图片 → 裁剪 → 预设选 **ST7789 240×240**
+3. 可选：缩放算法、抖动（Floyd–Steinberg / Bayer）、色深模拟 RGB565
+4. 「导出 BIN」得到小端 RGB565 帧文件
+
+**推到设备：**
+
+```powershell
+pip install pyserial pillow
+
+# 任意 PNG/JPG，自动缩放
+python tools\push-frame.py "C:\path\to\photo.png"
+
+# 用转换器导出的 BIN
+python tools\push-frame.py tools\st7789-convert\st7789_240x240.bin
+
+# 显示几秒后自动回表情机
+python tools\push-frame.py photo.png --quit-to-rest --hold-sec 5
+```
+
+**frame 协议摘要：**
+
+```
+host → device:  frame 240 240\n
+device → host:  ok frame-ready\n
+host → device:  <W*H*2 字节 RGB565 小端>
+device → host:  ok frame\n
+```
+
+屏上会保持静态图；再发任意状态词或 `face:0` 即恢复表情。详见 `tools/README-frame.md`。
+
+> 推图前先停掉 `mochi-bridge.py`，避免抢串口。固件需含 `frame` 扩展（当前 `clawd_mochi.ino` 已包含）。
+
+### 6. ST7789 转换器还能做什么
+
+| 能力 | 说明 |
+|------|------|
+| 多屏预设 | 240×240 / 135×240 / 240×280 / 240×320 / ILI9341 320×240 / 自定义 |
+| 缩放 | 平滑（照片）/ 最近邻（硬边像素） |
+| 抖动 | 关闭 / Floyd–Steinberg / Bayer 4×4 / Bayer 8×8 |
+| 色深模拟 | RGB565 / RGB555 / RGB444 / RGB332 / 1-bit |
+| 导出 | PNG 预览、C 数组（Arduino `pushImage`）、BIN（`esp_lcd` / 本项目 `push-frame.py`） |
+
+单片机通用用法（不依赖本仓库时）：
+
+```cpp
+// 导出 C 数组后
+tft.pushImage(0, 0, 240, 240, image_data);
+```
 
 ---
 
@@ -283,9 +346,10 @@ pip install --user pyserial
 | M0 | 屏幕点亮 | 完成 |
 | M1 | 串口状态机 | 完成 |
 | M2 | 程序化表情引擎 | 完成 |
-| M3 | 像素精灵推送（实验） | 完成（协议层） |
+| M3 | 像素精灵推送（48×48） | 完成 |
 | M4 | 仲裁 / 自愈 | 完成（对齐成品规则） |
-| M5 | 上位机闭环（桥接） | 完成（本仓库） |
+| M5 | 上位机闭环（桥接） | 完成 |
+| M6 | 全屏刷图 + ST7789 转换器 | 完成 |
 
 ---
 

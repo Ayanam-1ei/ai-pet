@@ -10,14 +10,29 @@
  * 差异: 成品用 RLE 精灵图；本源码用 GFX 图元程序化绘制动画。
  *       协议兼容，上位机桥接可直接复用。
  *
+ * 刷图扩展 (M6):
+ *   frame <W> <H>\n  + W*H*2 字节 RGB565 小端二进制   → 全屏静态图
+ *   sprite:begin / sprite:row:Y:hex / sprite:end      → 48×48 放大到 240×240
+ *   任意状态词或 face: 即退出静态图，恢复表情机
+ *
  * 烧录(Arduino IDE): 板=ESP32C3 Dev Module, USB CDC On Boot=Enabled,
  *                    Partition=Huge APP(3MB), CPU=160MHz, Upload=921600
  * 烧录(命令行):      tools\build-and-flash.ps1 -Flash
  */
 
 #include <SPI.h>
+#include <string.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+
+// 开机静态图：推送成功后写入 SPIFFS，上电自动显示
+// 多槽位：每张 240×240≈112KB，SPIFFS 约 1MB → 放 5 张较稳
+#define PHOTO_SLOTS 5
+#define PHOTO_IDX_PATH "/photo.idx"
+uint8_t photoSlot = 0;   // 下次 frame 保存到的槽
+uint8_t bootSlot = 0;    // 开机显示的槽
 
 // ---------------- 接线（ST7789 -> ESP32-C3）----------------
 #define TFT_CS   4
@@ -58,6 +73,10 @@ const uint32_t BOOT_INFO_MS        = 8000;
 const uint32_t FRAME_MS            = 125;   // 8fps
 const uint32_t FRAME_SLEEP_MS      = 250;   // sleep 4fps
 
+// 静态刷图色彩极性：本板 + Adafruit writeColor/BIN 通路实测需反相
+// （与 fillScreen 画表情时的表现不一致；若换屏/换库后偏色，改成 0x0000 再试）
+const uint16_t PHOTO_INVERT_MASK   = 0xFFFF;
+
 // ---------------- 运行状态 ----------------
 uint8_t  mood = MOOD_MANUAL;
 uint8_t  manualView = 0;          // 0=idle 1=sleeping 2=terminal
@@ -73,12 +92,93 @@ uint32_t thinkingUntil = 0;
 uint32_t infoShownAt = 0;
 uint32_t animPhase = 0;           // 动画相位
 
+// ---- 静态刷图 / sprite 协议 ----
+enum RxMode : uint8_t {
+  RX_LINE = 0,
+  RX_FRAME_BINARY = 1,
+};
+RxMode rxMode = RX_LINE;
+bool     photoHold = false;       // 静态图停留中，暂停表情动画
+uint16_t frameW = 0, frameH = 0;
+uint16_t frameX = 0, frameY = 0;
+uint8_t  frameBytePhase = 0;
+uint16_t framePixel = 0;
+uint16_t *frameBuf = nullptr;     // 整帧 RGB565 缓冲
+
+#define SPRITE_N 48
+uint16_t spriteBuf[SPRITE_N * SPRITE_N];
+bool     spriteActive = false;
+uint8_t  spriteRowRecv = 0;
+
 uint16_t C_ORANGE, C_DARKBG, C_BLOB, C_INK, C_ACCENT, C_WHITE, C_TERM;
 
 // ================= setup / loop =================
 
 void setBacklight(bool on) {
   digitalWrite(TFT_BLK, on ? HIGH : LOW);
+}
+
+// slot 文件: /pN.bin  头 [w:u16][h:u16] + RGB565 LE
+void photoPath(char *out, size_t n, uint8_t slot) {
+  snprintf(out, n, "/p%u.bin", (unsigned)(slot % PHOTO_SLOTS));
+}
+
+bool savePhotoSlot(uint8_t slot, const uint16_t *buf, uint16_t w, uint16_t h) {
+  if (!buf || w < 1 || h < 1 || w > 240 || h > 240) return false;
+  char path[16];
+  photoPath(path, sizeof(path), slot);
+  File f = SPIFFS.open(path, FILE_WRITE);
+  if (!f) return false;
+  uint16_t hdr[2] = {w, h};
+  size_t ok1 = f.write((const uint8_t *)hdr, 4);
+  size_t ok2 = f.write((const uint8_t *)buf, (size_t)w * h * 2);
+  f.close();
+  return ok1 == 4 && ok2 == (size_t)w * h * 2;
+}
+
+bool loadPhotoSlot(uint8_t slot) {
+  char path[16];
+  photoPath(path, sizeof(path), slot);
+  if (!SPIFFS.exists(path)) return false;
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) return false;
+  uint16_t hdr[2] = {0, 0};
+  if (f.read((uint8_t *)hdr, 4) != 4) { f.close(); return false; }
+  uint16_t w = hdr[0], h = hdr[1];
+  if (w < 1 || h < 1 || w > 240 || h > 240) { f.close(); return false; }
+  size_t need = (size_t)w * h * 2;
+  uint16_t *buf = (uint16_t *)malloc(need);
+  if (!buf) { f.close(); return false; }
+  size_t got = f.read((uint8_t *)buf, need);
+  f.close();
+  if (got != need) { free(buf); return false; }
+  blitFramebuffer(buf, w, h);
+  free(buf);
+  bootSlot = slot % PHOTO_SLOTS;
+  return true;
+}
+
+void saveBootIdx() {
+  File f = SPIFFS.open(PHOTO_IDX_PATH, FILE_WRITE);
+  if (!f) return;
+  f.write(bootSlot);
+  f.close();
+}
+
+uint8_t loadBootIdx() {
+  File f = SPIFFS.open(PHOTO_IDX_PATH, FILE_READ);
+  if (!f) return 0;
+  int v = f.read();
+  f.close();
+  if (v < 0 || v >= PHOTO_SLOTS) return 0;
+  return (uint8_t)v;
+}
+
+// 兼容旧单文件 /photo.bin → 槽 0
+void migrateLegacyPhoto() {
+  if (SPIFFS.exists("/photo.bin") && !SPIFFS.exists("/p0.bin")) {
+    SPIFFS.rename("/photo.bin", "/p0.bin");
+  }
 }
 
 void setup() {
@@ -101,16 +201,32 @@ void setup() {
   manualBg = C_DARKBG;
   animBgColor = C_DARKBG;
 
+  Serial.setRxBufferSize(8192);
   Serial.begin(115200);
-  bootSplash();
-  infoShownAt = millis();
+
+  SPIFFS.begin(true);
+  migrateLegacyPhoto();
   lastEventMs = millis();
   moodStartMs = millis();
   moodTick = millis();
+
+  bootSlot = loadBootIdx();
+  photoSlot = bootSlot;
+  if (loadPhotoSlot(bootSlot)) {
+    showingInfo = false;
+  } else {
+    bootSplash();
+    infoShownAt = millis();
+  }
 }
 
 void loop() {
   serialTick();
+  // 收二进制帧时绝不绘制，避免刷屏挤掉 USB CDC 数据
+  if (rxMode == RX_FRAME_BINARY) return;
+  // 静态刷图优先：开机睡眠/表情动画都不得覆盖
+  if (photoHold) return;
+
   uint32_t now = millis();
 
   // 开机信息页 → 睡眠
@@ -173,21 +289,139 @@ void bootSplash() {
   tft.setCursor(52, 112); tft.print("USB Ready");
 }
 
-// ================= 串口（与成品协议一致）=================
+// ================= 串口（与成品协议一致 + 刷图扩展）=================
 
 void serialTick() {
-  static char buf[40];
-  static uint8_t len = 0;
+  if (rxMode == RX_FRAME_BINARY) {
+    frameBinaryTick();
+    return;
+  }
+
+  static char buf[256];   // sprite:row 的 hex 行约 192 字符，需加大
+  static uint16_t len = 0;
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
-      if (len > 0) { buf[len] = '\0'; len = 0; handleSerialLine(String(buf)); }
+      if (len > 0) {
+        buf[len] = '\0';
+        len = 0;
+        handleSerialLine(String(buf));
+        if (rxMode == RX_FRAME_BINARY) return; // 刚进入二进制接收
+      }
     } else if (len < sizeof(buf) - 1) {
       buf[len++] = c;
     } else {
       len = 0;
     }
   }
+}
+
+void leavePhoto() {
+  photoHold = false;
+  spriteActive = false;
+  if (rxMode == RX_FRAME_BINARY) {
+    rxMode = RX_LINE;
+    frameW = frameH = frameX = frameY = 0;
+    frameBytePhase = 0;
+  }
+  if (frameBuf) {
+    free(frameBuf);
+    frameBuf = nullptr;
+  }
+}
+
+void beginFrameReceive(uint16_t w, uint16_t h) {
+  leavePhoto();
+  if (w < 1 || h < 1 || w > 240 || h > 240) {
+    Serial.println("err size");
+    return;
+  }
+  frameBuf = (uint16_t *)malloc((size_t)w * h * sizeof(uint16_t));
+  if (!frameBuf) {
+    Serial.println("err oom");
+    return;
+  }
+  frameW = w;
+  frameH = h;
+  frameX = 0;
+  frameY = 0;
+  frameBytePhase = 0;
+  rxMode = RX_FRAME_BINARY;
+  Serial.println("ok frame-ready");
+}
+
+void blitFramebuffer(uint16_t *buf, uint16_t w, uint16_t h) {
+  // 必须走 writeColor（与 GFX 同路径），不要用 writePixels / drawRGBBitmap：
+  // - drawRGBBitmap 逐像素太慢会 WDT
+  // - ESP32 SPI.writePixels 的 endian-swap 会打乱 RGB565
+  tft.startWrite();
+  tft.setAddrWindow(0, 0, w, h);
+  const uint32_t n = (uint32_t)w * (uint32_t)h;
+  for (uint32_t i = 0; i < n; i++) {
+    tft.writeColor(buf[i] ^ PHOTO_INVERT_MASK, 1);
+    if ((i & 0x3FF) == 0) delay(0);
+  }
+  tft.endWrite();
+  showingInfo = false;
+  termMode = false;
+  photoHold = true;
+  lastEventMs = millis();
+}
+
+void frameBinaryTick() {
+  bool got = false;
+  while (Serial.available()) {
+    got = true;
+    uint8_t b = (uint8_t)Serial.read();
+    if (frameBytePhase == 0) {
+      framePixel = b;
+      frameBytePhase = 1;
+    } else {
+      framePixel |= ((uint16_t)b << 8);
+      frameBytePhase = 0;
+      frameBuf[frameY * frameW + frameX] = framePixel;
+      frameX++;
+      if (frameX >= frameW) {
+        frameX = 0;
+        frameY++;
+        if (frameY >= frameH) {
+          savePhotoSlot(photoSlot, frameBuf, frameW, frameH);
+          bootSlot = photoSlot;
+          saveBootIdx();
+          blitFramebuffer(frameBuf, frameW, frameH);
+          free(frameBuf);
+          frameBuf = nullptr;
+          rxMode = RX_LINE;
+          Serial.println("ok frame");
+          return;
+        }
+        // 每 8 行让出 CPU，避免 USB CDC 任务饿死
+        if ((frameY & 7) == 0) delay(0);
+      }
+    }
+  }
+  if (!got) delay(0);
+}
+
+// 48×48 最近邻放大到 240×240（×5）
+void drawSpriteScaled() {
+  const int scale = 240 / SPRITE_N;
+  uint16_t *fb = (uint16_t *)malloc(240 * 240 * sizeof(uint16_t));
+  if (!fb) {
+    Serial.println("err oom");
+    return;
+  }
+  for (int y = 0; y < 240; y++) {
+    int sy = y / scale;
+    for (int x = 0; x < 240; x++) {
+      fb[y * 240 + x] = spriteBuf[sy * SPRITE_N + (x / scale)];
+    }
+  }
+  blitFramebuffer(fb, 240, 240);
+  savePhotoSlot(photoSlot, fb, 240, 240);
+  bootSlot = photoSlot;
+  saveBootIdx();
+  free(fb);
 }
 
 uint16_t hexToRgb565(const String& s) {
@@ -201,6 +435,153 @@ uint16_t hexToRgb565(const String& s) {
 void handleSerialLine(String line) {
   line.trim();
   if (line.length() == 0) return;
+
+  // ---- 刷图 / sprite 扩展 ----
+  if (line.startsWith("frame ")) {
+    // frame <W> <H>
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 < 0 || sp2 < 0) { Serial.println("err frame"); return; }
+    uint16_t w = (uint16_t)line.substring(sp1 + 1, sp2).toInt();
+    uint16_t h = (uint16_t)line.substring(sp2 + 1).toInt();
+    beginFrameReceive(w, h);
+    return;
+  }
+
+  if (line == "sprite:begin") {
+    leavePhoto();
+    spriteActive = true;
+    spriteRowRecv = 0;
+    memset(spriteBuf, 0, sizeof(spriteBuf));
+    Serial.println("ok sprite");
+    return;
+  }
+
+  if (line.startsWith("sprite:row:")) {
+    if (!spriteActive) { Serial.println("err no-begin"); return; }
+    // sprite:row:<y>:<hex 48*4>
+    int p1 = line.indexOf(':', 11);
+    if (p1 < 0) { Serial.println("err row"); return; }
+    int y = line.substring(11, p1).toInt();
+    String hex = line.substring(p1 + 1);
+    if (y < 0 || y >= SPRITE_N || hex.length() < SPRITE_N * 4) {
+      Serial.println("err row");
+      return;
+    }
+    for (int x = 0; x < SPRITE_N; x++) {
+      String cell = hex.substring(x * 4, x * 4 + 4);
+      spriteBuf[y * SPRITE_N + x] = (uint16_t)strtoul(cell.c_str(), NULL, 16);
+    }
+    spriteRowRecv = y + 1;
+    Serial.print("ok ");
+    Serial.println(y);
+    return;
+  }
+
+  if (line == "sprite:end") {
+    if (!spriteActive) { Serial.println("err no-begin"); return; }
+    spriteActive = false;
+    drawSpriteScaled();
+    Serial.println("ok face");
+    return;
+  }
+
+  if (line == "photo:off") {
+    leavePhoto();
+    showManual();
+    Serial.println("ok rest");
+    return;
+  }
+
+  // photo:slot N — 之后 frame 存到槽 N
+  if (line.startsWith("photo:slot ")) {
+    int n = line.substring(11).toInt();
+    if (n < 0 || n >= PHOTO_SLOTS) { Serial.println("err slot"); return; }
+    photoSlot = (uint8_t)n;
+    Serial.print("ok slot ");
+    Serial.println(photoSlot);
+    return;
+  }
+
+  // photo:show N — 显示槽 N 并记为开机槽
+  if (line.startsWith("photo:show ")) {
+    int n = line.substring(11).toInt();
+    if (n < 0 || n >= PHOTO_SLOTS) { Serial.println("err slot"); return; }
+    if (loadPhotoSlot((uint8_t)n)) {
+      saveBootIdx();
+      Serial.print("ok show ");
+      Serial.println(n);
+    } else {
+      Serial.println("err empty");
+    }
+    return;
+  }
+
+  if (line == "photo:next" || line == "photo:prev") {
+    int step = (line == "photo:next") ? 1 : -1;
+    for (int k = 1; k <= PHOTO_SLOTS; k++) {
+      int n = (bootSlot + step * k + PHOTO_SLOTS * 2) % PHOTO_SLOTS;
+      if (loadPhotoSlot((uint8_t)n)) {
+        saveBootIdx();
+        Serial.print("ok show ");
+        Serial.println(n);
+        return;
+      }
+    }
+    Serial.println("err empty");
+    return;
+  }
+
+  // photo:clear [N|all]
+  if (line.startsWith("photo:clear")) {
+    String arg = line.substring(11);
+    arg.trim();
+    if (arg == "all" || arg == "") {
+      char path[16];
+      for (int i = 0; i < PHOTO_SLOTS; i++) {
+        photoPath(path, sizeof(path), (uint8_t)i);
+        SPIFFS.remove(path);
+      }
+      SPIFFS.remove(PHOTO_IDX_PATH);
+      leavePhoto();
+      showManual();
+      Serial.println("ok cleared all");
+      return;
+    }
+    int n = arg.toInt();
+    if (n < 0 || n >= PHOTO_SLOTS) { Serial.println("err slot"); return; }
+    char path[16];
+    photoPath(path, sizeof(path), (uint8_t)n);
+    SPIFFS.remove(path);
+    Serial.print("ok cleared ");
+    Serial.println(n);
+    return;
+  }
+
+  // photo:list — 回哪些槽有图
+  if (line == "photo:list") {
+    Serial.print("ok slots");
+    char path[16];
+    for (int i = 0; i < PHOTO_SLOTS; i++) {
+      photoPath(path, sizeof(path), (uint8_t)i);
+      if (SPIFFS.exists(path)) {
+        Serial.print(' ');
+        Serial.print(i);
+      }
+    }
+    Serial.println();
+    return;
+  }
+
+  // 任意表情/配置命令：先退出静态图，再走原逻辑
+  if (photoHold && (line == "idle" || line == "thinking" || line == "reading" ||
+                    line == "coding" || line == "running" || line == "done" ||
+                    line == "error" || line == "waiting" || line == "sleep" ||
+                    line == "delegating" || line == "planning" ||
+                    line == "compacting" || line == "notify" ||
+                    line.startsWith("face:"))) {
+    leavePhoto();
+  }
 
   if (line.startsWith("face:")) {
     manualView = (uint8_t)constrain(line.substring(5).toInt(), 0, 2);
