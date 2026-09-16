@@ -1,372 +1,119 @@
 # Clawd Mochi · AI 桌面情绪伴宠（有线版）
 
-一块巴掌大的 ESP32 小屏，跑着会「卖萌」的麻薯（mochi）。它通过 USB 串口接收上位机状态，把 AI 助手当前在干什么，变成对应的表情动画。
+ESP32-C3 + ST7789 小屏麻薯。USB 串口收状态词，把 AI 在干什么变成表情；也可推全屏静态图。
 
 ```
-┌─────────────┐    串口状态词     ┌──────────────┐    SPI     ┌────────────┐
-│ 电脑 / AI   │  ──────────────► │   ESP32-C3   │ ─────────► │ ST7789 屏  │
-│ 桥接脚本    │   @115200 一行  │  状态机固件   │            │ 240×240    │
-└─────────────┘                  └──────────────┘            └────────────┘
+电脑（桥接/脚本） ──串口 115200──► ESP32-C3 ──SPI──► ST7789 240×240
 ```
-
-### 一次完整回合，屏幕会怎么变
-
-| 步骤 | 事件 | 状态词 | 表情 |
-|------|------|--------|------|
-| 1 | 你发出问题，AI 开始思考 | `thinking` | 思考脸 |
-| 2 | 读文件 / 搜索 | `reading` | 扫描脸 |
-| 3 | 改代码 | `coding` | 打字脸 |
-| 4 | 跑命令 | `running` | 施工脸 |
-| 5 | 派子任务 | `delegating` | 指挥脸 |
-| 6 | 需要你确认 | `waiting` | 警示脸 |
-| 7 | 本轮结束 | `done` | 庆祝脸 → 约 5 秒回待机 |
-| 8 | 会话结束 | `sleep` | 睡觉 |
-
-设计原则：**电脑主动推状态，设备只负责画**；发送失败不影响 AI 干活；事件丢了也能靠超时自愈。
 
 ---
 
 ## 硬件
 
-### 物料清单（BOM）
+| 项目 | 内容 |
+|------|------|
+| 主控 | ESP32-C3 Super Mini |
+| 屏幕 | ST7789 1.54" 240×240 SPI |
+| 接线 | VCC→3V3，GND→GND，SCL→GPIO8，SDA→GPIO10，RES→GPIO2，DC→GPIO1，CS→GPIO4，BL→GPIO3 |
+| 线材 | **必须用 USB 数据线**（纯充电线无串口） |
 
-| 部件 | 规格 | 说明 | 参考价 |
-|------|------|------|--------|
-| 主控 | ESP32-C3 Super Mini | RISC-V，原生 USB 串口 | ~¥18 |
-| 屏幕 | ST7789 1.54" 240×240 SPI（无触摸） | 显示表情 | ~¥20 |
-| 杜邦线 | 8 根，8–10 cm | 屏幕 ↔ 主控 | ~¥3 |
-| 螺丝 | M2×4 mm ×2 | 固定屏幕边框 | — |
-| USB-C 线 | **必须是数据线** | 供电 + 传状态 | — |
-| 外壳 | 3D 打印 PLA/PETG，约 30 g | 可选 | — |
-
-整机大约 **¥50** 左右（不含打印）。
-
-> **务必用 USB 数据线，不要用纯充电线。**  
-> 充电线只能供电，电脑认不出串口：既烧不了固件，也传不了状态词，麻薯只会一直待机。
-
-### 接线表（ST7789 → ESP32-C3）
-
-硬件 SPI，速度优先。**VCC 只能接 3.3V，绝对不要接 5V。**
-
-| 屏幕引脚 | ESP32-C3 | 作用 | 建议线色 |
-|----------|----------|------|----------|
-| VCC | 3V3 | 电源 3.3V | 红 |
-| GND | GND | 地 | 黑 |
-| SDA | GPIO10 | SPI MOSI（数据） | 橙 |
-| SCL | GPIO8 | SPI SCK（时钟） | 绿 |
-| RES | GPIO2 | 复位 | 紫 |
-| DC | GPIO1 | 数据/命令 | 蓝 |
-| CS | GPIO4 | 片选 | 白 |
-| BL | GPIO3 | 背光（高电平亮） | 黄 |
-
-固件里的对应定义：
-
-```cpp
-#define TFT_CS  4
-#define TFT_DC  1
-#define TFT_RST 2
-#define TFT_BLK 3
-SPI.begin(8, -1, 10, -1);   // SCK=8, MOSI=10
-tft.init(240, 240);
-tft.setSPISpeed(40000000);
-tft.setRotation(1);
-```
-
-**为什么选 GPIO8 / GPIO10：** 这是 ESP32-C3 的硬件 SPI 脚，40 MHz 下动画更流畅，同时 loop 里还能及时收串口。
-
-### 供电与数据（同一根线）
-
-- USB-C 插**电脑**：一根线同时供电 + 传事件
-- 插充电头：只能当摆件，不会跟 AI 变脸
-- 背光由 GPIO3 控制，也可用串口 `light:on` / `light:off`
-- 典型电流约 50–80 mA（亮屏 + 动画）
-
-### 建议组装顺序
-
-1. 打印/准备好外壳，先试装
-2. 按上表接 8 根线，再三确认 VCC 在 **3V3**
-3. 烧录固件（见下文），确认出现橙色开机页和绿色 **USB Ready**
-4. 装入外壳，USB 数据线引到电脑
+**VCC 只能接 3.3V，不要接 5V。**
 
 ---
 
 ## 仓库结构
 
 ```
-ai-pet/
-├── clawd_mochi/
-│   └── clawd_mochi.ino          # 固件本体（Arduino，含表情机 + 刷图扩展）
-├── clawd_mochi_diag/
-│   └── clawd_mochi_diag.ino     # 屏幕诊断：只刷纯色，查花屏/白屏
-├── docs/
-│   └── st7789-开发对话.md        # 刷图链路开发过程与踩坑记录
-└── tools/
-    ├── build-and-flash.ps1      # 编译 / 烧录（arduino-cli）
-    ├── send-state.ps1           # 手动发一个状态词
-    ├── mochi-bridge.py          # M5 桥接：跟 AI 活动自动变脸
-    ├── start-bridge.ps1         # 启动桥接
-    ├── pixel-studio.html        # 48×48 格子画板（浏览器）
-    ├── pixel-studio.py          # 画板本地服务 + 串口推送
-    ├── start-pixel-studio.ps1   # 启动画板
-    ├── push-test-sprite.py      # 命令行推 48×48 测试图
-    ├── push-frame.py            # M6：推全屏 240×240 静态图
-    ├── README-frame.md          # 刷图协议说明
-    └── st7789-convert/          # 图片 → ST7789 像素图网页工具
-        ├── index.html
-        ├── app.js
-        ├── styles.css
-        └── st7789_240x240.bin   # 示例 RGB565 小端帧
+clawd_mochi/          固件（表情机 + frame 刷图）
+clawd_mochi_diag/     屏幕诊断（纯色循环）
+docs/                 开发对话记录
+tools/
+  build-and-flash.ps1 编译烧录
+  send-state.ps1      手动发状态词
+  mochi-bridge.py     跟 AI 活动自动变脸
+  start-bridge.ps1
+  push-frame.py       推全屏静态图
+  st7789-convert/     图片 → RGB565 网页工具
 ```
 
 ---
 
-## 串口协议（与成品固件兼容）
+## 串口协议
 
-- 波特率 **115200**，8N1
-- **一词一行**，以 `\n` 结尾
-- 设备 VID/PID：`303A:1001`
+一行一个词，`\n` 结尾，115200 8N1。设备 `VID:PID = 303A:1001`。
 
-### 状态词（13 个）
+**状态词：** `idle` `thinking` `reading` `coding` `running` `delegating` `planning` `waiting` `compacting` `notify` `done` `error` `sleep`  
+未知词按 `idle`。
 
-| 词 | 表情含义 |
-|----|----------|
-| `idle` | 待机，轻轻浮动 |
-| `thinking` | 思考 |
-| `reading` | 读文件 / 搜索 |
-| `coding` | 写代码 |
-| `running` | 跑命令 |
-| `delegating` | 派子任务 |
-| `planning` | 规划 |
-| `waiting` | 等待确认 |
-| `compacting` | 压缩上下文 |
-| `notify` | 提醒 |
-| `done` | 本轮完成（约 5 秒后回落） |
-| `error` | 出错 |
-| `sleep` | 休眠 |
-
-未知词按 `idle` 处理（安全默认）。
-
-### 可选指令
+**可选：**
 
 | 指令 | 作用 |
 |------|------|
-| `face:0` | 休息脸 = 待机动画 |
-| `face:1` | 休息脸 = 睡眠动画 |
-| `face:2` | 休息脸 = 终端文字视图 |
-| `bg:#RRGGBB` | 休息底色（工作态始终品牌橙） |
-| `light:on` / `light:off` | 背光开关 |
-
-### 刷图扩展（M6）
-
-| 指令 | 作用 |
-|------|------|
-| `frame W H` + W×H×2 字节 RGB565 小端 | 全屏静态图（W,H≤240） |
-| `sprite:begin` / `sprite:row:Y:hex` / `sprite:end` | 48×48 像素画板，×5 放大上屏 |
-| `photo:off` | 退出静态图 → 休息表情 |
-
-静态图停留期间暂停表情动画；任意状态词（如 `coding`）或 `face:0` 可恢复。
-
-推送工具：
-
-```powershell
-pip install pyserial pillow
-python tools\push-frame.py photo.png --quit-to-rest
-python tools\push-frame.py st7789_240x240.bin
-```
-
-详见 `tools/README-frame.md`。
+| `face:0/1/2` | 休息脸：待机 / 睡眠 / 终端 |
+| `bg:#RRGGBB` | 休息底色 |
+| `light:on/off` | 背光 |
+| `frame W H` + RGB565 二进制 | 全屏静态图 |
 
 ---
 
 ## 快速开始
 
-### 1. 烧录固件
-
-**Arduino IDE**
-
-1. 安装 ESP32 板支持与库：`Adafruit GFX`、`Adafruit ST7735 and ST7789`
-2. 板子选 **ESP32C3 Dev Module**
-3. 关键选项：
-   - USB CDC On Boot = **Enabled**
-   - Partition Scheme = **Huge APP (3MB)**
-   - CPU = 160 MHz
-   - Upload Speed = 921600
-4. 打开 `clawd_mochi/clawd_mochi.ino`，上传
-
-**命令行（Windows）**
+### 烧录
 
 ```powershell
-# 首次：安装 ESP32 核心与依赖库（约 300MB）
-.\tools\build-and-flash.ps1 -Setup
-
-# 仅编译
-.\tools\build-and-flash.ps1
-
-# 编译 + 烧录（自动找 COM 口）
+.\tools\build-and-flash.ps1 -Setup   # 首次
 .\tools\build-and-flash.ps1 -Flash
 ```
 
-> 提示：项目路径尽量用纯英文，中文路径偶发 arduino-cli 兼容问题。
+Arduino IDE：板 **ESP32C3 Dev Module**，USB CDC On Boot=Enabled，Huge APP(3MB)。
 
-### 2. 手动测试表情
+### 测表情
 
 ```powershell
 .\tools\send-state.ps1 thinking
-.\tools\send-state.ps1 coding
 .\tools\send-state.ps1 done
-.\tools\send-state.ps1 sleep
 ```
 
-发送时不要同时开着 Arduino 串口监视器（会占用 COM 口）。
-
-### 3. 跟 AI 活动自动变脸（M5 桥接）
-
-桥接会轮询本地会话数据库，把「思考 / 读文件 / 写代码 / 跑命令」映射成状态词，写入串口。
+### 跟 AI 变脸
 
 ```powershell
-# 启动（会占用串口）
+pip install pyserial
 .\tools\start-bridge.ps1
-
-# 停止
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-  Where-Object { $_.CommandLine -like '*mochi-bridge*' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 ```
 
-依赖：Python 3 + `pyserial`
+桥接轮询会话状态并写串口。推图时先停掉它，避免抢 COM 口。
 
-```powershell
-pip install --user pyserial
-```
+### 推图片上屏
 
-说明：
-
-- 约 400ms 轮询一次，状态没变不发串口，对设备压力很小
-- 串口识别靠 `VID_303A&PID_1001`，认对一次后会写入缓存
-- 与画板**不要同时开**（会抢 COM 口）
-
-### 4. 像素画板（48×48 格子手绘）
-
-```powershell
-.\tools\start-pixel-studio.ps1
-```
-
-浏览器打开 `http://127.0.0.1:8765/`，48×48 格子画完点「推送到麻薯」。
-
-> 自定义像素图存在内存里，断电/复位会丢失；收到状态词会切回表情引擎。
-
-### 5. 任意图片 → 全屏静态图（M6 frame）
-
-配套网页工具已收进仓库：`tools/st7789-convert/`（来自独立项目 `S:\可视化\st7789`）。
-
-**步骤：**
-
-1. 用浏览器打开 `tools/st7789-convert/index.html`
-2. 拖入图片 → 裁剪 → 预设选 **ST7789 240×240**
-3. 可选：缩放算法、抖动（Floyd–Steinberg / Bayer）、色深模拟 RGB565
-4. 「导出 BIN」得到小端 RGB565 帧文件
-
-**推到设备：**
+1. 打开 `tools/st7789-convert/index.html`，裁剪导出 BIN  
+2. 推送：
 
 ```powershell
 pip install pyserial pillow
-
-# 任意 PNG/JPG，自动缩放
-python tools\push-frame.py "C:\path\to\photo.png"
-
-# 用转换器导出的 BIN
 python tools\push-frame.py tools\st7789-convert\st7789_240x240.bin
-
-# 显示几秒后自动回表情机
-python tools\push-frame.py photo.png --quit-to-rest --hold-sec 5
+python tools\push-frame.py photo.png --quit-to-rest
 ```
 
-**frame 协议摘要：**
-
-```
-host → device:  frame 240 240\n
-device → host:  ok frame-ready\n
-host → device:  <W*H*2 字节 RGB565 小端>
-device → host:  ok frame\n
-```
-
-屏上会保持静态图；再发任意状态词或 `face:0` 即恢复表情。详见 `tools/README-frame.md`。
-
-> 推图前先停掉 `mochi-bridge.py`，避免抢串口。固件需含 `frame` 扩展（当前 `clawd_mochi.ino` 已包含）。
-
-开发过程与踩坑（颜色反相、DTR 复位、SPIFFS 开机图、多槽位等）见：  
-[`docs/st7789-开发对话.md`](docs/st7789-开发对话.md)
-
-### 6. ST7789 转换器还能做什么
-
-| 能力 | 说明 |
-|------|------|
-| 多屏预设 | 240×240 / 135×240 / 240×280 / 240×320 / ILI9341 320×240 / 自定义 |
-| 缩放 | 平滑（照片）/ 最近邻（硬边像素） |
-| 抖动 | 关闭 / Floyd–Steinberg / Bayer 4×4 / Bayer 8×8 |
-| 色深模拟 | RGB565 / RGB555 / RGB444 / RGB332 / 1-bit |
-| 导出 | PNG 预览、C 数组（Arduino `pushImage`）、BIN（`esp_lcd` / 本项目 `push-frame.py`） |
-
-单片机通用用法（不依赖本仓库时）：
-
-```cpp
-// 导出 C 数组后
-tft.pushImage(0, 0, 240, 240, image_data);
-```
+详见 `tools/README-frame.md` 与 `docs/st7789-开发对话.md`。
 
 ---
 
-## 固件行为（对齐成品）
+## 固件要点
 
-| 规则 | 说明 |
-|------|------|
-| 工作态底色 | 固定品牌橙 `RGB(205,52,0)` |
-| 休息 / 睡眠底色 | `bg:` 自选色 / 深色 |
-| thinking 粘滞 | 约 1.1s 内工具状态不覆盖思考脸 |
-| done 回落 | 约 5s 后回到休息态 |
-| 工作超时 | 约 120s 无事件回到休息态 |
-| 开机流程 | 橙色 CLAWD MOCHI → 绿色 USB Ready → 8s 后入睡 |
-| 帧率 | 约 8fps；sleep 约 4fps |
+- 工作态固定橙底；休息可用 `bg:`
+- thinking 粘滞约 1.1s；done 约 5s 回休息；工作约 120s 超时
+- 开机：CLAWD MOCHI → USB Ready → 约 8s 入睡
+- 表情为 GFX 程序化绘制，改 `clawd_mochi.ino` 中 `drawCurrent()`
 
-表情全部用 Adafruit GFX 图元程序化绘制，不依赖图片素材。改脸型 / 配色直接改 `clawd_mochi.ino` 里的常量与 `drawCurrent()`。
+与交付成品 `firmware.bin` 协议兼容；成品用 RLE 精灵，本仓库用图元绘制。
 
 ---
 
-## 故障排查
+## 排查
 
 | 现象 | 处理 |
 |------|------|
-| 白屏 / 花屏 | 烧 `clawd_mochi_diag` 看纯色循环；仍异常则检查接线与供电 |
-| 找不到 COM 口 | 用数据线（非纯充电线）；设备管理器应出现 `VID_303A&PID_1001` |
-| 桥接打不开串口 | 关掉串口监视器 / 画板 / 其它占用 COM 的程序 |
-| 中文路径编译失败 | 把项目移到纯英文路径再试 |
-| 表情切得很快 | 桥接跟手是正常现象；想安静可停掉桥接 |
-
----
-
-## 里程碑
-
-| 阶段 | 内容 | 状态 |
-|------|------|------|
-| M0 | 屏幕点亮 | 完成 |
-| M1 | 串口状态机 | 完成 |
-| M2 | 程序化表情引擎 | 完成 |
-| M3 | 像素精灵推送（48×48） | 完成 |
-| M4 | 仲裁 / 自愈 | 完成（对齐成品规则） |
-| M5 | 上位机闭环（桥接） | 完成 |
-| M6 | 全屏刷图 + ST7789 转换器 | 完成 |
-
----
-
-## 与交付成品固件的关系
-
-- 协议、状态词、自愈节奏与成品 `firmware.bin` **兼容**
-- 成品使用 RLE 像素精灵；本仓库源码用图元绘制，观感更简
-- 成品 bin 适合「装完就用」；本仓库适合学习、改脸、二次开发
-- 桥接脚本可同时驱动成品 bin 与本仓库固件
-
----
-
-## License
-
-按你的仓库需要自行补充。
+| 白屏/花屏 | 烧 `clawd_mochi_diag` 查接线 |
+| 无 COM 口 | 换数据线；应出现 `303A:1001` |
+| 串口被占 | 关串口监视器 / 其它推图脚本 |
+| 中文路径编译失败 | 移到英文路径 |
