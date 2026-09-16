@@ -98,6 +98,8 @@ ai-pet/
 │   └── clawd_mochi.ino          # 固件本体（Arduino，含表情机 + 刷图扩展）
 ├── clawd_mochi_diag/
 │   └── clawd_mochi_diag.ino     # 屏幕诊断：只刷纯色，查花屏/白屏
+├── docs/
+│   └── st7789-开发对话.md        # 刷图链路开发过程与踩坑记录
 └── tools/
     ├── build-and-flash.ps1      # 编译 / 烧录（arduino-cli）
     ├── send-state.ps1           # 手动发一个状态词
@@ -291,6 +293,9 @@ device → host:  ok frame\n
 屏上会保持静态图；再发任意状态词或 `face:0` 即恢复表情。详见 `tools/README-frame.md`。
 
 > 推图前先停掉 `mochi-bridge.py`，避免抢串口。固件需含 `frame` 扩展（当前 `clawd_mochi.ino` 已包含）。
+
+开发过程与踩坑（颜色反相、DTR 复位、SPIFFS 开机图、多槽位等）见：  
+[`docs/st7789-开发对话.md`](docs/st7789-开发对话.md)
 
 ### 6. ST7789 转换器还能做什么
 
